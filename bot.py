@@ -1,16 +1,7 @@
-"""
-ربات تلگرامی که به Gemini (گوگل) وصل می‌شه و چت می‌کنه - کاملاً رایگان.
-
-قبل از اجرا باید این‌ها رو تنظیم کنی:
-1. TELEGRAM_BOT_TOKEN  -> توکنی که از BotFather گرفتی
-2. GEMINI_API_KEY      -> کلید رایگان که از aistudio.google.com می‌گیری
-
-این دو مقدار رو به صورت متغیر محیطی (Environment Variable) ست کن،
-یا خیلی ساده داخل همین فایل جای‌گزین کن (پایین‌تر توضیح داده شده).
-"""
-
 import os
 import logging
+from collections import defaultdict
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -19,45 +10,224 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 from google import genai
-from google.genai import types
 
-# ---------------------------------------------------------------
-# تنظیمات - این دو خط رو یا از Environment Variable می‌خونه
-# یا می‌تونی مستقیم رشته‌ی توکن/کلید رو بین "" بذاری (برای تست سریع)
-# ---------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "TOKEN-خودتو-اینجا-بذار")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "کلید-جمینای-خودتو-اینجا-بذار")
-GEMINI_MODEL = "gemini-2.5-flash"  # مدل رایگان و سریع
 
-# هر چند پیام آخر رو به عنوان حافظه‌ی مکالمه نگه داریم (به ازای هر کاربر)
-MAX_HISTORY = 10
-
-# شخصیت ربات - این متن به عنوان "system prompt" به کلود داده می‌شه
-# و رفتار و لحنش رو مشخص می‌کنه. هر جور دوست داری می‌تونی عوضش کنی.
-BOT_PERSONALITY = """
-تو یه دستیار باحال و صمیمی هستی که تو یه گروه یا چت خصوصی تلگرام حرف می‌زنی.
-لحنت خودمونی و دوستانه‌ست، نه رسمی و خشک. از طنز و شوخی مناسب استفاده کن،
-جواب‌ها رو کوتاه و طبیعی بده (مثل یه آدم واقعی که تو چته، نه مثل یه مقاله).
-می‌تونی از ایموجی به اندازه استفاده کنی ولی زیاده‌روی نکن.
-اگه کسی سوال جدی پرسید جدی و دقیق جواب بده، ولی همیشه لحن گرم و انسانی‌تو حفظ کن.
-"""
+# ---------------- تنظیمات ----------------
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-# حافظه‌ی ساده‌ی مکالمه برای هر چت (خصوصی یا گروه) - در رم -> با ری‌استارت پاک می‌شه
-user_histories: dict[int, list[dict]] = {}
+logger = logging.getLogger(name)
 
 
-def should_respond_in_group(update: Update, bot_username: str) -> bool:
-    """تو گروه فقط وقتی جواب بده که ربات منشن شده باشه یا روی پیام خودش ریپلای شده باشه."""
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+MODEL = "gemini-2.5-flash"
+
+
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
+
+
+BOT_PERSONALITY = """
+تو ربات «بذار من بگم» هستی.
+یک دستیار باحال، با اعتماد به نفس و کمی شوخ هستی.
+جواب‌ها کوتاه و طبیعی باشند.
+مثل یک دوست صحبت کن، نه مثل مقاله.
+اگر سوال مهم بود دقیق جواب بده.
+"""
+
+
+MAX_HISTORY = 10
+
+
+user_history = defaultdict(list)
+
+
+# ---------------- دستور شروع ----------------
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        "سلام 👋\n"
+        "من «بذار من بگم» هستم 😎\n"
+        "سوالت رو بپرس تا جواب بدم."
+    )
+
+
+# ---------------- بررسی پاسخ در گروه ----------------
+
+
+def can_reply(update):
+
     message = update.message
 
-    # حالت ۱: کسی روی پیام قبلی ربات ریپلای زده
-    if message.reply_to_messa
+    if not message:
+        return False
+
+
+    # چت خصوصی
+    if message.chat.type == "private":
+        return True
+
+
+    # اگر روی پیام ربات ریپلای شده
+    if message.reply_to_message:
+        return True
+
+
+    # اگر اسم ربات منشن شده باشد
+    if message.text and "@" in message.text:
+        return True
+
+
+    return False
+# ---------------- ارتباط با Gemini ----------------
+
+
+async def ask_gemini(user_id, text):
+
+    user_history[user_id].append(
+        {
+            "role": "user",
+            "content": text
+        }
+    )
+
+
+    # فقط آخرین پیام‌ها نگه داشته شوند
+    user_history[user_id] = user_history[user_id][-MAX_HISTORY:]
+
+
+    prompt = BOT_PERSONALITY + "\n\n"
+
+
+    for message in user_history[user_id]:
+        prompt += (
+            message["role"]
+            + ": "
+            + message["content"]
+            + "\n"
+        )
+
+
+    try:
+
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=prompt
+        )
+
+
+        answer = response.text
+
+
+        user_history[user_id].append(
+            {
+                "role": "assistant",
+                "content": answer
+            }
+        )
+
+
+        return answer
+
+
+    except Exception as error:
+
+        logger.error(error)
+
+        return "یه مشکلی پیش اومد، دوباره امتحان کن."
+
+
+# ---------------- دریافت پیام کاربران ----------------
+
+
+async def message_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+
+    if not can_reply(update):
+        return
+
+
+    text = update.message.text
+
+    if not text:
+        return
+
+
+    user_id = update.message.chat.id
+
+
+    await update.message.chat.send_action(
+        action="typing"
+    )
+
+
+    answer = await ask_gemini(
+        user_id,
+        text
+    )
+
+
+    await update.message.reply_text(
+        answer
+    )
+# ---------------- اجرای ربات ----------------
+
+
+def main():
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("خطا: TELEGRAM_BOT_TOKEN تنظیم نشده")
+        return
+
+
+    if not GEMINI_API_KEY:
+        print("خطا: GEMINI_API_KEY تنظیم نشده")
+        return
+
+
+    app = ApplicationBuilder() \
+        .token(TELEGRAM_BOT_TOKEN) \
+        .build()
+
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            message_handler
+        )
+    )
+
+
+    print("ربات روشن شد ✅")
+
+
+    app.run_polling()
+
+
+
+if name == "main":
+    main()
